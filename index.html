@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patience Measurement Device</title>
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            background-color: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        .task-container {
+            min-height: 200px;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            background-color: #f8f9fa;
+        }
+        .patience-meter {
+            height: 30px;
+            border-radius: 15px;
+            overflow: hidden;
+            background-color: #e9ecef;
+            margin-bottom: 15px;
+        }
+        .patience-progress {
+            height: 100%;
+            background: linear-gradient(90deg, #4caf50, #8bc34a);
+            transition: width 0.5s;
+        }
+        .stats-card {
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            background-color: #e9ecef;
+        }
+        .waiting-spinner {
+            display: inline-block;
+            width: 2rem;
+            height: 2rem;
+            border: 0.25rem solid rgba(0,0,0,0.1);
+            border-right-color: #007bff;
+            border-radius: 50%;
+            animation: spinner 1s linear infinite;
+        }
+        @keyframes spinner {
+            to {transform: rotate(360deg);}
+        }
+        .btn-primary {
+            background-color: #4caf50;
+            border-color: #4caf50;
+        }
+        .btn-primary:hover {
+            background-color: #3e8e41;
+            border-color: #3e8e41;
+        }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+        const { useSyncExternalStore } = React;
+
+        const room = new WebsimSocket();
+
+        function App() {
+            const [currentUser, setCurrentUser] = useState(null);
+            const [currentTask, setCurrentTask] = useState(null);
+            const [taskState, setTaskState] = useState('waiting'); // waiting, in_progress, completed
+            const [taskStartTime, setTaskStartTime] = useState(null);
+            const [patienceScore, setPatienceScore] = useState(0);
+            const [taskHistory, setTaskHistory] = useState([]);
+            const [feedback, setFeedback] = useState('');
+            const [loading, setLoading] = useState(true);
+
+            // Get all scores from the database
+            const allScores = useSyncExternalStore(
+                room.collection('patience_score').subscribe,
+                room.collection('patience_score').getList
+            );
+
+            // Get all task completions from the database
+            const allTasks = useSyncExternalStore(
+                room.collection('patience_task').subscribe,
+                room.collection('patience_task').getList
+            );
+
+            // Calculate statistics
+            const stats = useMemo(() => {
+                if (allScores.length === 0) return { rank: 0, percentile: 0, average: 0 };
+                
+                const sortedScores = [...allScores].sort((a, b) => b.score - a.score);
+                const userRank = sortedScores.findIndex(s => s.username === currentUser?.username) + 1;
+                const percentile = Math.round((allScores.length - userRank) / allScores.length * 100);
+                const average = Math.round(sortedScores.reduce((acc, s) => acc + s.score, 0) / sortedScores.length);
+                
+                return {
+                    rank: userRank || 0,
+                    percentile: percentile || 0,
+                    average: average || 0,
+                    totalUsers: allScores.length
+                };
+            }, [allScores, currentUser]);
+
+            // Initialize user when component mounts
+            useEffect(() => {
+                const initUser = async () => {
+                    try {
+                        // Get user info
+                        const user = await room.getUser();
+                        setCurrentUser(user);
+                        
+                        // Get user's score if it exists
+                        const userScores = allScores.filter(s => s.username === user.username);
+                        if (userScores.length > 0) {
+                            setPatienceScore(userScores[0].score);
+                        }
+                        
+                        // Get user's task history
+                        const userTasks = allTasks.filter(t => t.username === user.username);
+                        setTaskHistory(userTasks);
+                        
+                        // Generate first task
+                        generateNewTask(userTasks.length, userScores.length > 0 ? userScores[0].score : 0);
+                        
+                        setLoading(false);
+                    } catch (err) {
+                        console.error("Error initializing user:", err);
+                        setLoading(false);
+                    }
+                };
+                
+                initUser();
+            }, []);
+
+            // Generate a new task using LLM
+            const generateNewTask = async (taskCount, currentScore) => {
+                setLoading(true);
+                try {
+                    const difficultyLevel = Math.min(10, Math.max(1, Math.floor(currentScore / 10) + 1));
+                    
+                    const taskPrompt = `Generate a patience-testing task for a user. 
+                        The user has completed ${taskCount} tasks so far and has a patience score of ${currentScore}.
+                        The task should be at difficulty level ${difficultyLevel} (on a scale of 1-10).
+                        
+                        The task should:
+                        - Test the user's patience in a unique and interesting way
+                        - Be completable within 1-3 minutes
+                        - Include clear instructions
+                        - Provide a way to measure success
+                        
+                        Respond with JSON that includes:
+                        {
+                          "taskTitle": "Brief task title",
+                          "taskDescription": "Detailed instructions for the user",
+                          "estimatedTimeSeconds": Number of seconds it should take,
+                          "difficulty": Numeric value from 1-10,
+                          "patienceType": "One of: waiting, repetition, precision, frustration, or distraction"
+                        }`;
+
+                    const completion = await websim.chat.completions.create({
+                        messages: [
+                            { role: "system", content: "You are an AI that creates patience-testing tasks." },
+                            { role: "user", content: taskPrompt }
+                        ],
+                        json: true
+                    });
+
+                    const task = JSON.parse(completion.content);
+                    setCurrentTask(task);
+                    setTaskState('waiting');
+                    setFeedback('');
+                    setLoading(false);
+                } catch (err) {
+                    console.error("Error generating task:", err);
+                    setCurrentTask({
+                        taskTitle: "Simple Waiting Task",
+                        taskDescription: "Wait for 15 seconds without clicking any buttons or leaving this page.",
+                        estimatedTimeSeconds: 15,
+                        difficulty: 1,
+                        patienceType: "waiting"
+                    });
+                    setTaskState('waiting');
+                    setLoading(false);
+                }
+            };
+
+            // Start the current task
+            const startTask = () => {
+                setTaskState('in_progress');
+                setTaskStartTime(Date.now());
+            };
+
+            // Complete the current task
+            const completeTask = async () => {
+                if (taskState !== 'in_progress') return;
+                
+                setLoading(true);
+                try {
+                    const endTime = Date.now();
+                    const timeSpent = (endTime - taskStartTime) / 1000;
+                    
+                    // Record the task completion
+                    const taskRecord = await room.collection('patience_task').create({
+                        taskTitle: currentTask.taskTitle,
+                        difficulty: currentTask.difficulty,
+                        patienceType: currentTask.patienceType,
+                        estimatedTimeSeconds: currentTask.estimatedTimeSeconds,
+                        actualTimeSeconds: timeSpent,
+                        completedAt: new Date().toISOString()
+                    });
+                    
+                    // Update task history
+                    setTaskHistory([...taskHistory, taskRecord]);
+
+                    // Calculate new score based on the task performance
+                    const patienceFactor = timeSpent / currentTask.estimatedTimeSeconds;
+                    let scoreGain = Math.round(currentTask.difficulty * (patienceFactor >= 1 ? 5 : 2));
+                    
+                    // Apply bonus for consecutive task completion
+                    if (taskHistory.length > 0) {
+                        scoreGain = Math.round(scoreGain * (1 + taskHistory.length * 0.1));
+                    }
+                    
+                    const newScore = patienceScore + scoreGain;
+                    setPatienceScore(newScore);
+                    
+                    // Save or update score in database
+                    const userScores = allScores.filter(s => s.username === currentUser.username);
+                    if (userScores.length > 0) {
+                        await room.collection('patience_score').update(userScores[0].id, {
+                            score: newScore,
+                            tasksCompleted: (userScores[0].tasksCompleted || 0) + 1,
+                            lastUpdated: new Date().toISOString()
+                        });
+                    } else {
+                        await room.collection('patience_score').create({
+                            score: newScore,
+                            tasksCompleted: 1,
+                            lastUpdated: new Date().toISOString()
+                        });
+                    }
+                    
+                    // Generate feedback using LLM
+                    const feedbackPrompt = `
+                        The user just completed a patience task:
+                        - Task: ${currentTask.taskTitle}
+                        - Task type: ${currentTask.patienceType}
+                        - Difficulty: ${currentTask.difficulty}/10
+                        - Expected time: ${currentTask.estimatedTimeSeconds} seconds
+                        - Actual time: ${timeSpent.toFixed(1)} seconds
+                        - New patience score: ${newScore}
+                        - Completed tasks: ${taskHistory.length + 1}
+                        
+                        Please provide a brief, encouraging feedback message that:
+                        1. Comments on their patience performance for this specific task
+                        2. Mentions their new score
+                        3. Gives a short insight about patience as a virtue
+                        
+                        Keep it under 3 sentences and make it motivational.
+                    `;
+
+                    const completion = await websim.chat.completions.create({
+                        messages: [
+                            { role: "system", content: "You are an AI that provides feedback on patience tests." },
+                            { role: "user", content: feedbackPrompt }
+                        ]
+                    });
+                    
+                    setFeedback(completion.content);
+                    setTaskState('completed');
+                    setLoading(false);
+                    
+                } catch (err) {
+                    console.error("Error completing task:", err);
+                    setLoading(false);
+                }
+            };
+
+            // Get next task
+            const getNextTask = () => {
+                generateNewTask(taskHistory.length, patienceScore);
+            };
+
+            if (loading && !currentTask) {
+                return (
+                    <div className="container text-center">
+                        <h1 className="mb-4">Patience Measurement Device</h1>
+                        <p>Initializing your patience test...</p>
+                        <div className="waiting-spinner mx-auto"></div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="container">
+                    <h1 className="text-center mb-4">Patience Measurement Device</h1>
+                    
+                    {/* Patience Score Display */}
+                    <div className="mb-4">
+                        <h4>Your Patience Score: {patienceScore}</h4>
+                        <div className="patience-meter">
+                            <div 
+                                className="patience-progress" 
+                                style={{width: `${Math.min(100, patienceScore/2)}%`}}
+                            ></div>
+                        </div>
+                    </div>
+                    
+                    {/* Task Display */}
+                    <div className="task-container">
+                        {loading ? (
+                            <div className="text-center">
+                                <div className="waiting-spinner"></div>
+                                <p className="mt-3">Loading your next patience challenge...</p>
+                            </div>
+                        ) : (
+                            <>
+                                <h3>{currentTask?.taskTitle}</h3>
+                                <p>{currentTask?.taskDescription}</p>
+                                
+                                {taskState === 'waiting' && (
+                                    <button 
+                                        className="btn btn-primary mt-3" 
+                                        onClick={startTask}
+                                    >
+                                        Start Task
+                                    </button>
+                                )}
+                                
+                                {taskState === 'in_progress' && (
+                                    <button 
+                                        className="btn btn-success mt-3" 
+                                        onClick={completeTask}
+                                    >
+                                        I've Completed This Task
+                                    </button>
+                                )}
+                                
+                                {taskState === 'completed' && (
+                                    <>
+                                        <div className="alert alert-success">
+                                            {feedback || "Task completed! You've demonstrated patience."}
+                                        </div>
+                                        <button 
+                                            className="btn btn-primary mt-2" 
+                                            onClick={getNextTask}
+                                        >
+                                            Next Task
+                                        </button>
+                                    </>
+                                )}
+                            </>
+                        )}
+                    </div>
+                    
+                    {/* Stats Section */}
+                    <div className="row">
+                        <div className="col-md-6">
+                            <div className="stats-card">
+                                <h5>Your Stats</h5>
+                                <p>Tasks Completed: {taskHistory.length}</p>
+                                <p>Current Score: {patienceScore}</p>
+                            </div>
+                        </div>
+                        <div className="col-md-6">
+                            <div className="stats-card">
+                                <h5>Leaderboard Stats</h5>
+                                <p>Your Rank: {stats.rank || 'N/A'} of {stats.totalUsers || 0}</p>
+                                <p>Percentile: {stats.percentile || 0}%</p>
+                                <p>Average Score: {stats.average || 0}</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    {/* Task History */}
+                    {taskHistory.length > 0 && (
+                        <div className="mt-4">
+                            <h4>Task History</h4>
+                            <div className="table-responsive">
+                                <table className="table table-sm">
+                                    <thead>
+                                        <tr>
+                                            <th>Task</th>
+                                            <th>Type</th>
+                                            <th>Difficulty</th>
+                                            <th>Time (s)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {taskHistory.slice(-5).reverse().map((task, index) => (
+                                            <tr key={index}>
+                                                <td>{task.taskTitle}</td>
+                                                <td>{task.patienceType}</td>
+                                                <td>{task.difficulty}/10</td>
+                                                <td>{Math.round(task.actualTimeSeconds)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('app'));
+    </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
